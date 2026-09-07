@@ -37,6 +37,9 @@ public class TickExporterMain {
     private static final long CHUNK_MS = 24L * 60 * 60 * 1000; // 24 hours
     private static final long SLEEP_BETWEEN_CHUNKS_MS = 50;
 
+    // Max time to wait until an instrument is actually subscribed
+    private static final int SUBSCRIBE_TIMEOUT_SEC = 60;
+
     public static void main(String[] args) throws Exception {
         String instrumentStr = firstNonBlank(
                 System.getProperty("instrument"),
@@ -152,13 +155,33 @@ public class TickExporterMain {
             System.exit(1);
         }
 
+        // ---- Subscribe the instrument and WAIT until it is actually subscribed ----
+        // Crypto / energy / commodity instruments are NOT in the default forex
+        // subscription set, so a fixed sleep is not enough. Poll until it appears.
         Set<Instrument> instruments = new HashSet<>();
         instruments.add(instrument);
         client.setSubscribedInstruments(instruments);
-        // small wait so subscription is ready
-        Thread.sleep(3000);
+        log.info("Requested subscription for: {}", instrument);
 
-                long processId = client.startStrategy(new TickExportStrategy(instrument, from, to, csvFile, success));
+        int subWait = SUBSCRIBE_TIMEOUT_SEC;
+        while (subWait-- > 0 && !client.getSubscribedInstruments().contains(instrument)) {
+            Thread.sleep(1000);
+        }
+
+        if (!client.getSubscribedInstruments().contains(instrument)) {
+            log.error("Instrument {} could not be subscribed within {}s. "
+                    + "Check that your Dukascopy demo account has access to this instrument "
+                    + "(crypto/energy/commodities require the instrument to be tradable on the account).",
+                    instrument, SUBSCRIBE_TIMEOUT_SEC);
+            try { client.disconnect(); } catch (Exception ignored) {}
+            System.exit(1);
+        }
+
+        log.info("Subscribed instruments: {}", client.getSubscribedInstruments());
+        // small extra wait so the price feed is fully ready before requesting history
+        Thread.sleep(2000);
+
+        long processId = client.startStrategy(new TickExportStrategy(instrument, from, to, csvFile, success));
 
         // Wait for strategy to finish
         boolean completed = finished.await(5, TimeUnit.HOURS);
@@ -216,6 +239,16 @@ public class TickExporterMain {
         public void onStart(IContext context) throws JFException {
             history = context.getHistory();
             console = context.getConsole();
+
+            // Ensure the instrument is subscribed at the strategy level too.
+            // This is a safety net in case the context lost the subscription.
+            if (!context.getSubscribedInstruments().contains(instrument)) {
+                Set<Instrument> toSub = new HashSet<>();
+                toSub.add(instrument);
+                context.setSubscribedInstruments(toSub, true); // true = block until subscribed
+                console.getOut().println("Strategy subscribed instrument: " + instrument);
+                log.info("Strategy subscribed instrument: {}", instrument);
+            }
 
             PrintWriter out = null;
             try {
